@@ -28,6 +28,7 @@
 19. [关键设计决策总结](#19-关键设计决策总结)
 20. [task-notification 注入机制：不在系统提示词中](#20-task-notification-注入机制不在系统提示词中)
 21. [执行中的新用户查询处理](#21-执行中的新用户查询处理)
+22. [完整示例：task-notification 各阶段 API 消息结构](#22-完整示例task-notification-各阶段-api-消息结构)
 
 ---
 
@@ -2150,6 +2151,370 @@ enqueue({ value, priority: 'next' })           // ← 同时入队
 ```
 
 中断信号让 SleepTool 提前结束，`query.ts` 收到中断后退出当前循环，`useQueueProcessor` 随即处理排队的用户消息——用户消息可以**更快被响应**，而不必等待 Sleep 倒计时结束。
+
+---
+
+## 22. 完整示例：task-notification 各阶段 API 消息结构
+
+### 场景设定
+
+用户请求："帮我用后台 Agent 分析 src/ 目录下的安全漏洞"
+
+主 Agent 启动一个异步 Agent，然后调用 SleepTool 等待结果，后台 Agent 完成后发送通知。
+
+下面逐一展示每个阶段，真正发送给大模型的 **system** 和 **messages** 内容。
+
+---
+
+### 阶段 1：任务提交前（用户发送消息）
+
+这是最初始的状态。系统提示词包含能力描述和工具定义，messages 只有一条用户消息。
+
+```
+┌─ API Request 1 ──────────────────────────────────────────────────┐
+│                                                                    │
+│  system:                                                           │
+│    "You are Claude Code, Anthropic's official CLI for Claude...   │
+│     <tools_available>Agent, Bash, Read, Write, Sleep, ...</tools> │
+│     <context>CWD: /home/user/project, Date: 2026-06-03</context>" │
+│    （系统提示词每次请求都完整发送，始终不变）                      │
+│                                                                    │
+│  messages: [                                                       │
+│    {                                                               │
+│      role: "user",                                                 │
+│      content: "帮我用后台 Agent 分析 src/ 目录下的安全漏洞"       │
+│    }                                                               │
+│  ]                                                                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**此时队列状态**：`commandQueue = []`（空）
+
+---
+
+### 阶段 2：主 Agent 启动异步任务（async_launched 返回）
+
+大模型决定调用 `Agent` 工具启动后台任务。`AgentTool` 执行完毕，返回 `async_launched`，这个 `tool_result` 和下一轮 assistant 消息合并，发送下一次 API 请求。
+
+```
+┌─ API Response 1（大模型返回）──────────────────────────────────────┐
+│  {                                                                  │
+│    role: "assistant",                                               │
+│    content: [                                                       │
+│      { type: "text", text: "好的，启动后台安全分析..." },           │
+│      {                                                              │
+│        type: "tool_use",                                           │
+│        id: "toolu_001",                                            │
+│        name: "Agent",                                              │
+│        input: {                                                     │
+│          prompt: "分析 src/ 目录下所有 TypeScript 文件的安全漏洞，  │
+│                   重点检查 XSS、SQL注入、命令注入",                 │
+│          description: "安全漏洞分析"                               │
+│        }                                                           │
+│      }                                                             │
+│    ]                                                               │
+│  }                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+`AgentTool.call()` 执行：创建后台任务 `agent-a1b2c3d`，立即返回：
+
+```typescript
+// AgentTool.tsx:1327  工具返回的 tool_result 内容
+{
+  type: 'tool_result',
+  tool_use_id: 'toolu_001',
+  content: [{
+    type: 'text',
+    text: `Async agent launched successfully.
+agentId: agent-a1b2c3d (internal ID - do not mention to user. \
+Use SendMessage with to: 'agent-a1b2c3d' to continue this agent.)
+The agent is working in the background. You will be notified automatically when it completes.
+Do not duplicate this agent's work — avoid working with the same files or topics it is using.
+output_file: /home/user/.claude/tasks/agent-a1b2c3d/output.txt
+If asked, you can check progress before completion by using Read or Bash tail on the output file.`
+  }]
+}
+```
+
+```
+┌─ API Request 2 ──────────────────────────────────────────────────┐
+│                                                                    │
+│  system: "（同上，每次都完整发送）"                                │
+│                                                                    │
+│  messages: [                                                       │
+│    { role: "user",                                                 │
+│      content: "帮我用后台 Agent 分析 src/ 目录下的安全漏洞" },     │
+│                                                                    │
+│    { role: "assistant", content: [                                 │
+│        { type: "text", text: "好的，启动后台安全分析..." },         │
+│        { type: "tool_use", id: "toolu_001", name: "Agent", ... }   │
+│      ]},                                                           │
+│                                                                    │
+│    { role: "user", content: [                                      │
+│        {                                                           │
+│          type: "tool_result",                                      │
+│          tool_use_id: "toolu_001",                                 │
+│          content: [{                                               │
+│            type: "text",                                           │
+│            text: "Async agent launched successfully.\n             │
+│                   agentId: agent-a1b2c3d ...\n                     │
+│                   output_file: ...agent-a1b2c3d/output.txt\n..."   │
+│          }]                                                        │
+│        }                    ← 仅此一个 content 块                  │
+│      ]}                                                            │
+│  ]                                                                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**此时队列状态**：`commandQueue = []`（后台任务刚启动，还在运行中）
+
+---
+
+### 阶段 3：主 Agent 调用 SleepTool 等待
+
+大模型收到 `async_launched` 回执后，决定等待结果，调用 `Sleep(duration: 60000)`。
+
+```
+┌─ API Response 2（大模型返回）──────────────────────────────────────┐
+│  {                                                                  │
+│    role: "assistant",                                               │
+│    content: [                                                       │
+│      { type: "text",                                               │
+│        text: "任务已启动，等待后台分析完成..." },                   │
+│      {                                                              │
+│        type: "tool_use",                                           │
+│        id: "toolu_002",                                            │
+│        name: "Sleep",                                              │
+│        input: { duration: 60000 }   ← 等待 60 秒                   │
+│      }                                                             │
+│    ]                                                               │
+│  }                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+`Sleep` 工具开始执行（异步等待 60 秒）。
+
+**与此同时**，后台 Agent `agent-a1b2c3d` 在单独的异步上下文中运行，约 45 秒后完成：
+
+```typescript
+// LocalAgentTask.tsx:198  任务完成后调用
+enqueueAgentNotification({
+  taskId: 'agent-a1b2c3d',
+  description: '安全漏洞分析',
+  status: 'completed',
+  finalMessage: '分析完成，发现 3 个安全漏洞：\n1. src/api/auth.ts:42 SQL注入...',
+  usage: { totalTokens: 4521, toolUses: 12, durationMs: 45230 },
+  toolUseId: 'toolu_001',    // ← 与启动时的 tool_use_id 关联
+})
+
+// 内部调用：
+enqueuePendingNotification({
+  value: `<task-notification>
+<task-id>agent-a1b2c3d</task-id>
+<tool-use-id>toolu_001</tool-use-id>
+<output-file>/home/user/.claude/tasks/agent-a1b2c3d/output.txt</output-file>
+<status>completed</status>
+<summary>Agent "安全漏洞分析" completed</summary>
+<result>分析完成，发现 3 个安全漏洞：
+1. src/api/auth.ts:42 SQL注入风险...</result>
+<usage>
+  <total_tokens>4521</total_tokens>
+  <tool_uses>12</tool_uses>
+  <duration_ms>45230</duration_ms>
+</usage>
+</task-notification>`,
+  mode: 'task-notification',
+  // priority: 'later'  ← 自动设置
+})
+```
+
+**此时队列状态**：
+```
+commandQueue = [
+  {
+    mode: 'task-notification',
+    priority: 'later',               // ← 最低优先级
+    value: '<task-notification>...',
+    agentId: undefined               // ← 发给主线程
+  }
+]
+```
+
+---
+
+### 阶段 4：SleepTool 完成 + task-notification 注入（关键时刻）
+
+60 秒的 Sleep 完成（实际上后台 Agent 45 秒就完成了，提前入队了）。
+
+`query.ts` 主循环在 Sleep 的 `tool_result` 收集完后，执行队列检查：
+
+```typescript
+// query.ts:1569  SleepTool 运行完后的队列检查
+const sleepRan = toolUseBlocks.some(b => b.name === SLEEP_TOOL_NAME)  // ← true！
+
+const queuedCommandsSnapshot = getCommandsByMaxPriority(
+  sleepRan ? 'later' : 'next'   // ← sleepRan=true，取出 'later' 优先级的 task-notification
+).filter(cmd => {
+  if (isMainThread) return cmd.agentId === undefined  // ← 只取发给主线程的通知
+  return cmd.mode === 'task-notification' && cmd.agentId === currentAgentId
+})
+
+// 队列中有 1 个 task-notification，被取出处理
+// 转换为 UserMessage（messages.ts:3774）：
+wrapMessagesInSystemReminder([
+  createUserMessage({
+    content: wrapCommandText(notification.value, { kind: 'task-notification' }),
+    //       ↑ "A background agent completed a task:\n<task-notification>..."
+    isMeta: true,   // ← 在 UI 中隐藏，用户看不到
+    origin: { kind: 'task-notification' },
+  })
+])
+// 最终文本（wrapCommandText + wrapInSystemReminder 处理后）：
+// <system-reminder>
+// A background agent completed a task:
+// <task-notification>
+//   <task-id>agent-a1b2c3d</task-id>
+//   ...
+// </task-notification>
+// </system-reminder>
+
+removeFromQueue([notification])   // ← 立即从队列删除！
+```
+
+这些内容被加入 `toolResults[]` 和 Sleep 的 `tool_result` 合并，发出 API Request 3：
+
+```
+┌─ API Request 3 ──────────────────────────────────────────────────┐
+│                                                                    │
+│  system: "（同上，每次都完整发送，task-notification 不在这里）"    │
+│                                                                    │
+│  messages: [                                                       │
+│    { role: "user",                                                 │
+│      content: "帮我用后台 Agent 分析 src/ 目录下的安全漏洞" },     │
+│                                                                    │
+│    { role: "assistant", content: [  ← 启动后台 Agent              │
+│        { type: "text", text: "好的，启动后台安全分析..." },         │
+│        { type: "tool_use", id: "toolu_001", name: "Agent", ... }   │
+│      ]},                                                           │
+│                                                                    │
+│    { role: "user", content: [       ← async_launched 回执         │
+│        { type: "tool_result", tool_use_id: "toolu_001",           │
+│          content: [{ type: "text", text: "Async agent launched..." }]}
+│      ]},                                                           │
+│                                                                    │
+│    { role: "assistant", content: [  ← 主 Agent 调用 Sleep         │
+│        { type: "text", text: "任务已启动，等待后台分析完成..." },   │
+│        { type: "tool_use", id: "toolu_002", name: "Sleep", ... }   │
+│      ]},                                                           │
+│                                                                    │
+│    { role: "user", content: [       ← ★ 关键：Sleep结果 + 通知    │
+│        {                                                           │
+│          type: "tool_result",                                      │
+│          tool_use_id: "toolu_002",  ← Sleep 的 tool_result         │
+│          content: [{ type: "text", text: "Slept for 60000ms" }]   │
+│        },                                                          │
+│        {                                                           │
+│          type: "text",              ← task-notification（user消息）│
+│          text: "<system-reminder>                                  │
+│A background agent completed a task:                                │
+│<task-notification>                                                 │
+│<task-id>agent-a1b2c3d</task-id>                                   │
+│<tool-use-id>toolu_001</tool-use-id>                               │
+│<output-file>/home/user/.claude/tasks/agent-a1b2c3d/output.txt     │
+│</output-file>                                                      │
+│<status>completed</status>                                          │
+│<summary>Agent \"安全漏洞分析\" completed</summary>                 │
+│<result>分析完成，发现 3 个安全漏洞：                               │
+│1. src/api/auth.ts:42 SQL注入风险...</result>                       │
+│<usage>                                                             │
+│  <total_tokens>4521</total_tokens>                                 │
+│  <tool_uses>12</tool_uses>                                         │
+│  <duration_ms>45230</duration_ms>                                  │
+│</usage>                                                            │
+│</task-notification>                                                │
+│</system-reminder>"                                                 │
+│        }               ← task-notification 在 user content 内！    │
+│      ]}                ← 两个 content 块在同一个 user 消息里        │
+│  ]                                                                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**此时队列状态**：`commandQueue = []`（`removeFromQueue()` 已执行，队列清空）
+
+大模型在这个请求里，**同时看到**：
+- Sleep 已结束（`tool_result`）
+- 后台任务已完成（`<system-reminder>` 中的 `<task-notification>`）
+
+---
+
+### 阶段 5：通知消费后（removeFromQueue 之后）
+
+`removeFromQueue()` 在发送 API Request 3 **之前**就已执行。从这一刻起：
+
+- **内存队列**：`commandQueue = []`，通知不会再被取出
+- **对话历史**：`task-notification` 已经写入 `messages[]` 数组，作为正常历史消息保留
+- **下一次 API 请求**：通知作为历史消息自然存在，但不会"再注入一次"
+
+大模型 API Response 3（回应通知）：
+
+```
+┌─ API Response 3（大模型返回）──────────────────────────────────────┐
+│  {                                                                  │
+│    role: "assistant",                                               │
+│    content: [                                                       │
+│      { type: "text",                                               │
+│        text: "后台分析已完成！发现以下安全问题：\n\n              │
+│               1. **SQL注入** - src/api/auth.ts:42 ..." }          │
+│    ]                                                               │
+│  }                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+如果用户继续追问，下一次 API Request 4 的结构：
+
+```
+┌─ API Request 4 ──────────────────────────────────────────────────┐
+│                                                                    │
+│  system: "（同上，始终完整发送）"                                  │
+│                                                                    │
+│  messages: [                                                       │
+│    ... （所有之前的历史消息）                                       │
+│    { role: "user", content: [                                      │
+│        { type: "tool_result", tool_use_id: "toolu_002", ... },    │
+│        { type: "text",                                             │
+│          text: "<system-reminder>A background agent...</system-reminder>" }
+│      ]},                            ← task-notification 作为历史   │
+│    { role: "assistant",                                            │
+│      content: "后台分析已完成！..." },                              │
+│    { role: "user",                                                 │
+│      content: "能详细说说 SQL注入那个问题吗？" }                    │
+│                ↑ 用户的新消息                                       │
+│  ]                                                                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+注意：`task-notification` 在 Request 4 中**作为历史记录存在**（在 messages 数组中），而**不是**被重新注入（`commandQueue` 已清空，不会重复触发）。
+
+---
+
+### 关键点总结对比
+
+| 时间点 | system 字段 | messages 中 task-notification | commandQueue |
+|--------|------------|-------------------------------|--------------|
+| 阶段 1：任务提交前 | 工具/上下文描述 | 不存在 | 空 |
+| 阶段 2：async_launched | 同上（不变） | 不存在 | 空 |
+| 阶段 3：Sleep 执行中 | 同上（不变） | 不存在（但在队列中） | `[{priority:'later'}]` |
+| 阶段 4：Sleep 结束，通知注入 | 同上（不变） | **存在**（user content 的 text 块） | 空（刚被移除） |
+| 阶段 5：后续对话 | 同上（不变） | 作为历史消息存在（不再重复注入） | 空 |
+
+**三个关键结论**：
+
+1. **永远不在 system 字段**：`task-notification` 整个生命周期里从不出现在 HTTP 请求的 `system` 字段中
+
+2. **`<system-reminder>` ≠ system prompt**：这只是 user 消息文本里的一段 XML，大模型理解它是"系统级注入信息"，但在 API 协议层面它是 `role: "user"` 的内容
+
+3. **一次性消费**：从 `commandQueue` 取出即删除（`removeFromQueue()`），后续对话中它作为普通历史消息存在，不会被重复注入
 
 ---
 
