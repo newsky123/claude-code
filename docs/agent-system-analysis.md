@@ -867,7 +867,7 @@ async call({ task_id }) {
 
 ## 8. Team Agent 协作机制
 
-Team Agent（`isAgentSwarmsEnabled()` 开启时可用）支持多个 Agent 在同一会话中协作，通过 **Mailbox（邮箱）** 机制传递消息。
+Team Agent（`isAgentSwarmsEnabled()` 开启时可用）实现多个独立 Agent 进程之间的协作，通过 **Mailbox（邮箱文件）** 机制传递消息。
 
 **启用方式**（满足其一即可）：
 ```bash
@@ -876,6 +876,122 @@ export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
 
 # 方式2：CLI 标志
 claude --agent-teams
+```
+
+### 8.0 Coordinator 与 Teammate 的本质关系
+
+> **一句话**：Coordinator 就是主 session 本身（切换到编排模式），Teammate 是独立的 CLI 子进程。两者不在同一个 REPL 实例里，通过文件系统 mailbox 通信。
+
+#### 8.0.1 不是"两个 agent 共用同一 session"
+
+很多人容易有这个误解，认为 main agent 和 team agent 运行在同一个 Claude Code 会话中。**实际不是**。
+
+| 角色 | 运行位置 | 激活方式 |
+|------|---------|---------|
+| **Coordinator（Leader）** | 主 Claude Code 进程，**主 session** | `COORDINATOR_MODE` 特性标志 or `CLAUDE_CODE_COORDINATOR_MODE=1` |
+| **Teammate** | 独立的新 Claude Code 进程，**独立 session** | `spawnMultiAgent.ts` 以子进程方式启动 |
+
+Coordinator 本质上是主 session 在激活编排模式后的身份切换——它的系统提示词变成编排者视角，工具行为切换为"派发 → 等待 → 汇总"，而不是直接执行任务。每个 Teammate 是通过以下命令行参数唯一标识的独立进程：
+
+```bash
+$ claude-code \
+    --agent-id "researcher@my-team" \    # 唯一身份
+    --agent-name "researcher" \          # 可寻址名称
+    --team-name "my-team" \              # 所属团队
+    --parent-session-id "<coordinator-id>"
+```
+
+#### 8.0.2 任务分配：100% 大模型驱动
+
+Coordinator **不**使用硬编码规则分配任务，而是让 LLM 自己决定。
+
+当 Coordinator LLM 决定需要某个 Teammate 执行某任务时，它生成一个 `tool_use` 调用：
+
+```json
+{
+  "type": "tool_use",
+  "name": "Agent",
+  "input": {
+    "prompt": "分析 src/auth.ts 的安全漏洞，重点检查 SQL 注入",
+    "description": "安全分析",
+    "name": "researcher",       ← 必填：有 name 才触发 teammate spawn
+    "team_name": "my-team"      ← 必填：和 name 一起才走 spawnTeammate() 路径
+  }
+}
+```
+
+`AgentTool` 检测到 `name` + `team_name` 同时存在 → 调用 `spawnTeammate()` → 启动独立进程 → 将 `prompt` 写入该 teammate 的 mailbox。
+
+**LLM 决定的内容**：
+- 是否需要派发子任务（还是自己处理）
+- 派发给哪个 teammate（`name` 参数）
+- 子任务的具体描述（`prompt` 参数）
+- 是否要求计划审批（`mode: 'plan'`）
+
+#### 8.0.3 结果如何返回给 Coordinator：不是 tool_result
+
+这是最容易混淆的部分。对比如下：
+
+```
+同步 subagent（§5）：
+  tool_use(Agent) → subagent 完整执行 → tool_result("任务完成，输出是...") → LLM 在同一轮看到
+
+异步/Team agent：
+  tool_use(Agent) → 立即返回 tool_result("async_launched，agentId=...") → LLM 知道任务已启动
+                                                              ↓
+                     [独立进程异步执行...]
+                                                              ↓
+                     任务完成 → enqueueAgentNotification() → commandQueue(priority:'later')
+                                                              ↓
+                     下一个 SleepTool 结束后注入 → <system-reminder> 包裹的 user 消息
+```
+
+Teammate 的最终结果**以 user 角色消息**形式注入 Coordinator 的对话，而不是 tool_result。Coordinator LLM 在 `<task-notification>` 里读到结果，然后决定下一步（汇总、继续派发、回复用户等）。
+
+Teammate 还可以在执行中途主动调用 `SendMessage({to:'team-lead', message:"..."})` 发送阶段性报告，这条消息走 mailbox → `useInboxPoller` → Coordinator 的新 turn，以 `<teammate-message>` XML 格式呈现。
+
+#### 8.0.4 完整交互时序
+
+```
+Coordinator session                    Teammate 进程
+─────────────────                      ─────────────
+用户："分析安全漏洞"
+  ↓
+LLM 决策：需要 researcher
+  ↓
+tool_use: Agent({name:"researcher"...})
+  ↓
+AgentTool → spawnTeammate()
+  → fork 独立 CLI 进程               进程启动
+  → 写 prompt 到 mailbox              ↓
+tool_result: "async_launched"          useInboxPoller 轮询（每1s）
+  ↓                                    ↓ 读到 prompt
+LLM: "已启动，等待..."                  ↓ 提交给自己的 LLM
+tool_use: Sleep(60000)                 执行工具（Read/Bash/Grep...）
+  ↓                                    ↓ 任务完成
+  ↓                                   enqueueAgentNotification()
+  ↓                                    → commandQueue(priority:'later')
+Sleep 结束                              ↓
+  ↓                                    （通知已在队列中）
+query.ts 检测 sleepRan=true
+  → 取出 task-notification
+  → user 消息注入（<system-reminder>）
+  ↓
+LLM 看到 <task-notification>:
+  status: completed
+  result: "发现 3 个漏洞..."
+  ↓
+LLM 汇总并回复用户
+
+           ——— 或者途中主动报告 ———
+
+                                       执行中调用：
+                                       SendMessage({to:'team-lead', msg:"..."})
+                                         → writeToMailbox(team-lead)
+Coordinator useInboxPoller
+  → 读到 <teammate-message>
+  → 提交为新 turn
+LLM: 收到阶段报告，决策...
 ```
 
 ### 8.1 架构概览
