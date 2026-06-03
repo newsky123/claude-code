@@ -15,15 +15,17 @@
 6. [Fork Agent：提示缓存优化路径](#6-fork-agent提示缓存优化路径)
 7. [后台任务运行机制](#7-后台任务运行机制)
 8. [Team Agent 协作机制](#8-team-agent-协作机制)
-9. [Agent 上下文隔离机制](#9-agent-上下文隔离机制)
-10. [工具并发调度](#10-工具并发调度)
-11. [权限系统](#11-权限系统)
-12. [Worktree 隔离](#12-worktree-隔离)
-13. [Hook 系统](#13-hook-系统)
-14. [自定义 Agent（用户/项目/插件）](#14-自定义-agent用户项目插件)
-15. [内置 Agent 详解](#15-内置-agent-详解)
-16. [完整示例](#16-完整示例)
-17. [关键设计决策总结](#17-关键设计决策总结)
+9. [ToolUseContext：Agent 执行环境的完整快照](#9-toolUseContext-agent-执行环境的完整快照)
+10. [Agent 上下文隔离机制](#10-agent-上下文隔离机制)
+11. [Agent 专属 MCP 服务器](#11-agent-专属-mcp-服务器)
+12. [工具并发调度](#12-工具并发调度)
+13. [权限系统](#13-权限系统)
+14. [Worktree 隔离](#14-worktree-隔离)
+15. [Hook 系统](#15-hook-系统)
+16. [自定义 Agent（用户/项目/插件）](#16-自定义-agent用户项目插件)
+17. [内置 Agent 详解](#17-内置-agent-详解)
+18. [完整示例](#18-完整示例)
+19. [关键设计决策总结](#19-关键设计决策总结)
 
 ---
 
@@ -312,21 +314,111 @@ AgentTool.call() → runAgent() → query()
 父 query() 拿到 tool_result，继续与模型对话
 ```
 
-同步 Agent 有一个 **"升级为后台"机制**（`autoBackgroundMs = 120000ms`）：
+同步 Agent 有一个 **"升级为后台"机制**（`autoBackgroundMs = 120000ms`）。
+
+#### 触发信号
 
 ```typescript
-// AgentTool.tsx:~800
-const raceResult = await Promise.race([
-  agentIterator.next(),                  // Agent 正常运行
-  registration.backgroundSignal          // 用户触发"后台化"信号
-])
+// AgentTool.tsx:819
+const registration = registerAgentForeground({
+  agentId: syncAgentId,
+  autoBackgroundMs: getAutoBackgroundMs() || undefined  // 超时自动后台化
+})
+const backgroundPromise = registration.backgroundSignal.then(() => ({ type: 'background' }))
 
+// 每轮 next() 都竞速，backgroundSignal 一旦 resolve 就触发后台化
+const raceResult = await Promise.race([
+  agentIterator.next().then(r => ({ type: 'message', result: r })),
+  backgroundPromise
+])
+```
+
+#### 后台化不是"属性变更"，而是**终止 + 重启**
+
+```typescript
 if (raceResult.type === 'background') {
   wasBackgrounded = true
-  void runWithAgentContext(...)  // 后台继续执行
-  return { status: 'async_launched', agentId, ... }  // 立即返回父循环
+
+  void runWithAgentContext(syncAgentContext, async () => {
+    // ① 终止前台 iterator（触发 runAgent finally 块的 9 步清理）
+    //    设 1 秒超时，防止 MCP 服务器清理挂死
+    await Promise.race([
+      agentIterator.return(undefined).catch(() => {}),
+      sleep(1000)
+    ])
+
+    // ② 已收到的消息仅用于进度条 UI 展示
+    for (const existingMsg of agentMessages) {
+      updateProgressFromMessage(tracker, existingMsg, ...)
+    }
+
+    // ③ 用原始参数从头启动新的后台 Agent（注意：同一个 runAgentParams）
+    for await (const msg of runAgent({
+      ...runAgentParams,      // ← 完全相同的原始 prompt，从 turn 1 重新开始
+      isAsync: true,
+      override: {
+        agentId: asAgentId(backgroundedTaskId),
+        abortController: task.abortController  // ← 切换为独立 AbortController
+      }
+    })) { ... }
+
+    completeAsyncAgent(agentResult, rootSetAppState)
+    enqueueAgentNotification({ status: 'completed', ... })
+  })
+
+  // ④ 立即返回"回执"，解锁父 query() 循环
+  return { status: 'async_launched', agentId: backgroundedTaskId, ... }
 }
 ```
+
+#### 关键结论：前台已完成的工作会丢失
+
+```
+前台 Agent（已运行 5 轮）：
+  turn 1: 读 src/api.ts ✓
+  turn 2: 修改 src/api.ts ✓（写入磁盘）
+  turn 3: 运行测试中...
+    ↓ 用户或超时触发 background
+  agentIterator.return() → finally 块清理
+
+后台 Agent（重新从 turn 1 开始）：
+  turn 1: 再次读 src/api.ts（已被前台改过）
+  turn 2: 尝试再次修改（遇到已修改的内容）
+  turn 3: ...
+```
+
+`agentMessages`（前台收集的消息）**仅用于进度显示**，不作为对话历史传入新 Agent。后台 Agent 拿到的是原始 `promptMessages`，从第 1 轮重新执行。
+
+**设计权衡**：实现简单（无需序列化/恢复对话状态），代价是前台遗留的副作用（已写文件、已执行命令）可能让后台运行遇到意外状态。因此，auto-background 超时通常设置较大（默认 120 秒），鼓励尽早后台化而非任务执行到一半再切换。
+
+#### finally 块在后台化时的特殊处理
+
+```typescript
+finally {
+  stopForegroundSummarization?.()
+
+  if (foregroundTaskId) {
+    unregisterAgentForeground(foregroundTaskId, rootSetAppState)
+    if (!wasBackgrounded) {  // ← 后台化时跳过 SDK 通知
+      enqueueSdkEvent({ type: 'task_notification', status: '...' })
+    }
+  }
+
+  clearInvokedSkillsForAgent(syncAgentId)
+
+  if (!wasBackgrounded) {  // ← 后台化时跳过以下清理（后台 Agent 还在运行）
+    clearDumpState(syncAgentId)
+  }
+
+  cancelAutoBackground?.()
+
+  if (!wasBackgrounded) {  // ← worktree 不清理，后台 Agent 继续使用
+    worktreeResult = await cleanupWorktreeIfNeeded()
+  }
+}
+```
+
+所有 `!wasBackgrounded` 条件保护的资源（worktree、dumpState、SDK 通知）都留给后台 Agent 的 `finally` 块处理。
 
 ### 5.3 异步 Agent 执行流程
 
@@ -641,6 +733,94 @@ function enqueueAgentNotification({ taskId, status, finalMessage, ... }) {
 }
 ```
 
+### 7.5.1 task-notification 到大模型的完整 5 层路径
+
+仅仅"写入队列"还不是终点，通知需要经过 5 层转化才能真正送达大模型：
+
+**第 1 层：写入全局 commandQueue（后台线程）**
+
+`commandQueue` 是 `messageQueueManager.ts` 中的进程级全局数组，同时通过 `useSyncExternalStore` 服务 React UI 和 `query()` 主循环。
+
+**第 2 层：query() 主循环每轮排水**
+
+```typescript
+// query.ts:1569
+const sleepRan = toolUseBlocks.some(b => b.name === SLEEP_TOOL_NAME)
+
+const queuedCommandsSnapshot = getCommandsByMaxPriority(
+  sleepRan ? 'later' : 'next'  // ← SleepTool 跑过才消费 'later' 优先级通知
+).filter(cmd => {
+  if (isMainThread) return cmd.agentId === undefined  // 主线程只消费无 agentId 的通知
+  return cmd.mode === 'task-notification' && cmd.agentId === currentAgentId
+})
+```
+
+**关键**：`priority: 'later'` 的通知在普通工具轮次**不可见**（`getCommandsByMaxPriority('next')` 会过滤掉它们）。只有当本轮有 `SleepTool` 执行，或主循环空闲时，才切换到 `'later'` 档位消费通知。这防止了后台通知在模型正在执行其他工具时强行打断它。
+
+**第 3 层：通知变成 Attachment**
+
+```typescript
+// attachments.ts:1047
+const INLINE_NOTIFICATION_MODES = new Set(['prompt', 'task-notification'])
+
+async function getQueuedCommandAttachments(queuedCommands): Promise<Attachment[]> {
+  const filtered = queuedCommands.filter(_ => INLINE_NOTIFICATION_MODES.has(_.mode))
+  return filtered.map(cmd => ({
+    type: 'queued_command',    // ← attachment 类型
+    prompt: cmd.value,         // ← 包含完整的 <task-notification> XML
+    commandMode: cmd.mode,     // ← 'task-notification'
+    source_uuid: cmd.uuid,
+  }))
+}
+```
+
+**第 4 层：Attachment 变成 UserMessage**
+
+```typescript
+// messages.ts:3774
+case 'queued_command': {
+  const origin = attachment.commandMode === 'task-notification'
+    ? { kind: 'task-notification' }
+    : undefined
+
+  return wrapMessagesInSystemReminder([
+    createUserMessage({
+      content: wrapCommandText(attachment.prompt, origin),
+      //        ↑ prompt 就是那段 <task-notification>...</task-notification> XML
+      isMeta: true,   // ← 系统注入，不在 UI 显示给用户
+      origin,
+    })
+  ])
+}
+```
+
+这个 UserMessage 被加入 `toolResults[]`，和本轮所有工具结果合并。
+
+**第 5 层：最终 API 请求结构**
+
+```
+API 请求（第 N+1 轮）：
+[
+  ... 之前对话历史,
+  assistant: { tool_use: { name: "Agent", id: "xxx" } },  ← 原来启动后台 Agent 的调用
+  user: {
+    content: [
+      { type: "tool_result", tool_use_id: "xxx",
+        content: "{ status: 'async_launched', agentId: '...' }" },  ← 原来的回执
+      { type: "text",
+        text: "<task-notification>
+                 <task-id>agent-uuid</task-id>
+                 <status>completed</status>
+                 <result>分析完成，发现 3 个安全问题...</result>
+                 <usage><total_tokens>4500</total_tokens>...</usage>
+               </task-notification>" }    ← 新追加的完成通知
+    ]
+  }
+]
+```
+
+大模型在同一轮对话中直接处理通知，无需重建连接。
+
 ### 7.6 TaskOutputTool：读取后台 Agent 输出
 
 ```typescript
@@ -847,11 +1027,82 @@ async call(input, context) {
 
 ---
 
-## 9. Agent 上下文隔离机制
+## 9. ToolUseContext：Agent 执行环境的完整快照
+
+`ToolUseContext`（定义于 `src/Tool.ts:158`）是所有工具执行时共享的上下文对象，也是 `createSubagentContext()` 的核心操作目标。
+
+### 9.1 结构分类
+
+```typescript
+export type ToolUseContext = {
+  // === 配置选项 ===
+  options: {
+    commands: Command[]           // 可用 slash 命令
+    mainLoopModel: string         // 当前模型名
+    tools: Tools                  // 当前可用工具列表
+    mcpClients: MCPServerConnection[]   // 已连接 MCP 服务器
+    agentDefinitions: AgentDefinitionsResult  // 所有 Agent 定义
+    thinkingConfig: ThinkingConfig
+    maxBudgetUsd?: number
+    customSystemPrompt?: string
+    refreshTools?: () => Tools    // MCP 动态连接时刷新工具
+  }
+
+  // === 状态读写 ===
+  abortController: AbortController      // 取消信号（父→子链式传播）
+  readFileState: FileStateCache         // 文件读取 LRU 缓存（独立克隆）
+  getAppState(): AppState               // 读全局状态
+  setAppState(f): void                  // 写全局状态（⚡异步 Agent 为 no-op）
+  setAppStateForTasks?: (f): void       // 穿透隔离写任务状态（背景任务专用）
+
+  // === Agent 身份 ===
+  agentId?: AgentId             // 子 Agent 才有，主线程为 undefined
+  agentType?: string            // "Explore" | "general-purpose" | ...
+  messages: Message[]           // 当前会话消息历史
+  queryTracking?: {
+    chainId: string             // 调用链标识（用于日志）
+    depth: number               // 嵌套深度（防无限递归）
+  }
+
+  // === UI 钩子（子 Agent 被置为 undefined）===
+  setToolJSX?: SetToolJSXFn             // 渲染工具自定义 UI
+  addNotification?: (notif) => void     // 添加通知
+  setStreamMode?: (mode) => void        // 控制 spinner 样式
+  appendSystemMessage?: (msg) => void
+  sendOSNotification?: (opts) => void
+
+  // === 并发控制 ===
+  setInProgressToolUseIDs(f)            // 追踪正在执行的工具（UI 加载状态）
+  setHasInterruptibleToolInProgress?: (v) => void
+
+  // === 资源限制 ===
+  fileReadingLimits?: { maxTokens?, maxSizeBytes? }
+  globLimits?: { maxResults? }
+  criticalSystemReminder_EXPERIMENTAL?: string  // 每轮强制注入的提示
+  toolUseId?: string            // 当前工具调用的 ID（用于关联）
+}
+```
+
+### 9.2 主线程 vs 子 Agent 的字段对比
+
+| 字段 | 主线程 | 同步子 Agent | 异步子 Agent |
+|------|--------|-------------|-------------|
+| `setAppState` | 真实写入 | 共享父级 | **no-op** |
+| `abortController` | 根控制器 | 链接父级 | **独立** |
+| `agentId` | `undefined` | 新 UUID | 新 UUID |
+| `setToolJSX` | 有效函数 | 有效函数 | **undefined** |
+| `addNotification` | 有效函数 | 有效函数 | **undefined** |
+| `setStreamMode` | 有效函数 | 有效函数 | **undefined** |
+| `queryTracking.depth` | 0 | parent+1 | parent+1 |
+| `shouldAvoidPermissionPrompts` | false | false | **true** |
+
+---
+
+## 10. Agent 上下文隔离机制
 
 每次启动子 Agent，都通过 `createSubagentContext()` 创建隔离的 `ToolUseContext`：
 
-### 9.1 三类操作
+### 10.1 三类操作
 
 ```typescript
 // forkedAgent.ts:345（简化）
@@ -884,7 +1135,7 @@ function createSubagentContext(parentContext, overrides) {
 }
 ```
 
-### 9.2 同步 vs 异步的 context 差异
+### 10.2 同步 vs 异步的 context 差异
 
 | 字段 | 同步 Agent | 异步 Agent |
 |------|-----------|-----------|
@@ -895,7 +1146,7 @@ function createSubagentContext(parentContext, overrides) {
 | `agentId` | 新 UUID | 新 UUID |
 | `depth` | `parent.depth + 1` | `parent.depth + 1` |
 
-### 9.3 深度追踪与递归防护
+### 10.3 深度追踪与递归防护
 
 ```typescript
 queryTracking = {
@@ -912,9 +1163,87 @@ queryTracking = {
 
 ---
 
-## 10. 工具并发调度
+## 11. Agent 专属 MCP 服务器
 
-### 10.1 并发判定
+Agent 可以在 frontmatter 中声明只在自身运行期间连接、结束后自动清理的 MCP 服务器（`agentDefinition.mcpServers`）。
+
+### 11.1 两种声明方式（`AgentMcpServerSpec`）
+
+```typescript
+// loadAgentsDir.ts:58
+type AgentMcpServerSpec =
+  | string                               // 引用已有全局服务器名（共享连接，不自动清理）
+  | { [name: string]: McpServerConfig }  // 内联定义（新建连接，Agent 结束后清理）
+```
+
+**方式 1：引用名称（共享，不清理）**
+```markdown
+mcpServers:
+  - github       ← 复用全局已连接的 github MCP，Agent 结束后不断开
+```
+
+**方式 2：内联定义（新建，自动清理）**
+```markdown
+mcpServers:
+  - my-postgres:
+      type: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-postgres"]
+      env:
+        DATABASE_URL: "postgresql://localhost/mydb"
+```
+
+### 11.2 初始化与清理（`initializeAgentMcpServers`，`runAgent.ts:95`）
+
+```typescript
+async function initializeAgentMcpServers(agentDefinition, parentClients) {
+  if (!agentDefinition.mcpServers?.length) {
+    return { clients: parentClients, tools: [], cleanup: async () => {} }
+  }
+
+  // 安全检查：plugin-only 模式下跳过非管理员信任来源的 Agent
+  if (isRestrictedToPluginOnly('mcp') && !isSourceAdminTrusted(agentDefinition.source)) {
+    return { clients: parentClients, tools: [], cleanup: async () => {} }
+  }
+
+  const newlyCreatedClients: MCPServerConnection[] = []  // 仅内联定义的服务器
+
+  for (const spec of agentDefinition.mcpServers) {
+    if (typeof spec === 'string') {
+      // 引用已有 → getMcpConfigByName() → connectToServer()（memoized，复用连接）
+      // isNewlyCreated = false → 不加入 newlyCreatedClients
+    } else {
+      // 内联定义 → 直接新建连接
+      // isNewlyCreated = true → 加入 newlyCreatedClients（结束时清理）
+    }
+    agentTools.push(...fetchToolsForClient(client))
+  }
+
+  return {
+    clients: [...parentClients, ...agentClients],  // 合并，传入 query()
+    tools: agentTools,                             // 新增的 MCP 工具
+    cleanup: async () => {
+      // 只清理内联定义的（引用的不动，父级还在用）
+      for (const client of newlyCreatedClients) await client.cleanup()
+    }
+  }
+}
+```
+
+### 11.3 对工具池的影响
+
+```
+父 Agent 工具池：[Read, Bash, mcp__github__*]
+                       ↓ 传入 initializeAgentMcpServers
+子 Agent 工具池：[Read, Bash, mcp__github__*, mcp__my-postgres__*]
+                                               ↑ Agent 专属，父级和其他 Agent 不可见
+```
+
+---
+
+## 12. 工具并发调度
+
+### 12.1 并发判定
 
 ```typescript
 // 工具是否并发安全，由工具自身声明
@@ -928,7 +1257,7 @@ Bash, Edit, Write                      // 可能有副作用
 Agent                                  // 可能修改 AppState
 ```
 
-### 10.2 并发分组（partitionToolCalls）
+### 12.2 并发分组（partitionToolCalls）
 
 在实际并发执行前，`partitionToolCalls()` 先将本轮所有工具调用按 `isConcurrencySafe` 分组：
 
@@ -945,7 +1274,7 @@ Agent                                  // 可能修改 AppState
 //   组4: [Bash]         ← 串行
 ```
 
-### 10.3 并发执行框架
+### 12.3 并发执行框架
 
 ```typescript
 // toolOrchestration.ts（简化）
@@ -976,7 +1305,7 @@ export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=5
 ```
 ```
 
-### 10.4 并发示例
+### 12.4 并发示例
 
 当模型同时发出 3 个工具调用：
 - `Read(file1)` + `Read(file2)` + `Grep(pattern)` → **并发执行**（都是只读）
@@ -985,9 +1314,9 @@ export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=5
 
 ---
 
-## 11. 权限系统
+## 13. 权限系统
 
-### 11.1 权限检查流程
+### 13.1 权限检查流程
 
 ```
 tool_use block
@@ -1009,7 +1338,7 @@ checkPermissions(args, context)
               └─ false → 显示 UI 对话框（同步 Agent / 主循环）
 ```
 
-### 11.2 permissionMode 含义
+### 13.2 permissionMode 含义
 
 | 模式 | 含义 |
 |------|------|
@@ -1020,7 +1349,7 @@ checkPermissions(args, context)
 | `dontAsk` | 不询问，按默认规则处理 |
 | `bubble` | 将权限提示"冒泡"到父 Agent 终端 |
 
-### 11.3 Agent 权限继承规则
+### 13.3 Agent 权限继承规则
 
 子 Agent 的权限规则不是简单继承，而是有选择地覆盖：
 
@@ -1039,9 +1368,9 @@ if (allowedTools !== undefined) {
 
 ---
 
-## 12. Worktree 隔离
+## 14. Worktree 隔离
 
-### 12.1 什么是 Worktree 隔离
+### 14.1 什么是 Worktree 隔离
 
 当 Agent 定义了 `isolation: 'worktree'` 时，Agent 会在一个独立的 git 工作树中运行，确保其文件修改不影响父 Agent 的工作目录。
 
@@ -1054,7 +1383,7 @@ if (allowedTools !== undefined) {
                   └─ Agent 完成后可以合并/删除
 ```
 
-### 12.2 Worktree 生命周期
+### 14.2 Worktree 生命周期
 
 ```typescript
 // AgentTool.tsx
@@ -1088,7 +1417,7 @@ const safeBranchName = `worktree-${slug.replace(/\//g, '+')}`
 - `agent-a<7hex>`：Agent 自动创建的工作树
 - `wf_<runId>-<idx>`：Workflow 创建的工作树
 
-### 12.3 worktree 完成后的结果
+### 14.3 worktree 完成后的结果
 
 如果子 Agent 在 worktree 中提交了代码，`AgentToolResult` 会包含：
 
@@ -1105,9 +1434,9 @@ const safeBranchName = `worktree-${slug.replace(/\//g, '+')}`
 
 ---
 
-## 13. Hook 系统
+## 15. Hook 系统
 
-### 13.1 Agent 级别的 Hook
+### 15.1 Agent 级别的 Hook
 
 与会话级 Hook（SessionStart/Stop）不同，Agent 自己可以在 frontmatter 中定义 Hook，只在该 Agent 运行期间有效：
 
@@ -1128,7 +1457,7 @@ hooks:
 ---
 ```
 
-### 13.2 Hook 注册和清理
+### 15.2 Hook 注册和清理
 
 ```typescript
 // runAgent.ts
@@ -1145,7 +1474,7 @@ registerFrontmatterHooks(
 clearSessionHooks(rootSetAppState, agentId)
 ```
 
-### 13.3 Hook 类型映射
+### 15.3 Hook 类型映射
 
 | 会话 Hook | Agent 对应 Hook |
 |-----------|----------------|
@@ -1156,9 +1485,9 @@ clearSessionHooks(rootSetAppState, agentId)
 
 ---
 
-## 14. 自定义 Agent（用户/项目/插件）
+## 16. 自定义 Agent（用户/项目/插件）
 
-### 14.1 文件位置优先级
+### 16.1 文件位置优先级
 
 ```
 ~/.claude/agents/<name>.md          ← userSettings（用户全局）
@@ -1166,7 +1495,7 @@ clearSessionHooks(rootSetAppState, agentId)
 <plugin-dir>/agents/<name>.md       ← plugin
 ```
 
-### 14.2 Agent 文件格式（完整字段）
+### 16.2 Agent 文件格式（完整字段）
 
 ```markdown
 ---
@@ -1199,7 +1528,7 @@ color: blue                          # 可选：UI 颜色
 你是一个代码审查专家...（系统提示词正文）
 ```
 
-### 14.3 加载机制
+### 16.3 加载机制
 
 ```typescript
 // loadAgentsDir.ts:296
@@ -1228,7 +1557,7 @@ const getAgentDefinitionsWithOverrides = memoize(async (cwd: string) => {
 })
 ```
 
-### 14.4 Memory（持久记忆）
+### 16.4 Memory（持久记忆）
 
 如果 Agent 定义了 `memory` 字段，系统会在工具列表中自动注入 `Write`/`Edit`/`Read` 工具（若未包含），并在系统提示词末尾追加记忆加载指令：
 
@@ -1243,9 +1572,9 @@ getSystemPrompt: () => {
 
 ---
 
-## 15. 内置 Agent 详解
+## 17. 内置 Agent 详解
 
-### 15.1 general-purpose
+### 17.1 general-purpose
 
 - **触发时机**：需要研究复杂问题、搜索代码、执行多步任务，搜索结果不确定时
 - **模型**：默认子代理模型
@@ -1254,7 +1583,7 @@ getSystemPrompt: () => {
   - 完成任务后返回简洁报告（调用方转述给用户）
   - 优先编辑已有文件，禁止随意创建新文件和 README
 
-### 15.2 Explore
+### 17.2 Explore
 
 - **触发时机**：快速代码库探索——找文件模式、搜关键字、回答代码库问题
 - **模型**：`haiku`（速度优先）
@@ -1265,7 +1594,7 @@ getSystemPrompt: () => {
   - 要求并行工具调用（快速返回）
   - 调用时须指定彻底程度：`quick` / `medium` / `very thorough`
 
-### 15.3 Plan
+### 17.3 Plan
 
 - **触发时机**：需要设计实现方案、识别关键文件、权衡架构取舍
 - **模型**：`inherit`（与主 Agent 相同，确保理解质量）
@@ -1275,7 +1604,7 @@ getSystemPrompt: () => {
   - 严格只读模式
   - 输出必须以"Critical Files for Implementation"结尾
 
-### 15.4 statusline-setup
+### 17.4 statusline-setup
 
 - **触发时机**：用户要求配置状态栏
 - **模型**：`sonnet`
@@ -1286,7 +1615,7 @@ getSystemPrompt: () => {
   - statusLine JSON 输入格式说明（含 context_window、rate_limits 等）
   - 完成后必须告知用户可继续修改
 
-### 15.5 claude-code-guide
+### 17.5 claude-code-guide
 
 - **触发时机**：用户询问 Claude Code/SDK/API 的使用方法
 - **模型**：`haiku`
@@ -1295,7 +1624,7 @@ getSystemPrompt: () => {
 - **特殊**：系统提示动态拼接（注入用户当前的 skills、agents、MCP 服务器、settings.json）
 - **调用前检查**：优先续接已有的 claude-code-guide Agent（via SendMessage），避免重复创建
 
-### 15.6 verification（当前关闭）
+### 17.6 verification（当前关闭）
 
 - **触发时机**：非平凡任务完成后（3+ 文件编辑、后端/API/基础设施变更）
 - **模型**：`inherit`
@@ -1309,7 +1638,7 @@ getSystemPrompt: () => {
 
 ---
 
-## 16. 完整示例
+## 18. 完整示例
 
 ### 示例 1：主 Agent 派发多个并发子 Agent
 
@@ -1489,9 +1818,9 @@ hooks:
 
 ---
 
-## 17. 关键设计决策总结
+## 19. 关键设计决策总结
 
-### 17.1 为什么主循环和子 Agent 用同一个 `query()`
+### 19.1 为什么主循环和子 Agent 用同一个 `query()`
 
 **好处**：
 - 代码复用：工具执行、流式处理、错误处理逻辑只写一份
@@ -1500,7 +1829,7 @@ hooks:
 
 **关键差异完全通过参数实现**：`ToolUseContext` 控制隔离程度，`systemPrompt` 控制角色，`tools` 控制能力范围。
 
-### 17.2 为什么后台 Agent 用"回执 + 通知"而不是阻塞
+### 19.2 为什么后台 Agent 用"回执 + 通知"而不是阻塞
 
 **阻塞方式的问题**：子 Agent 可能运行几分钟，阻塞期间主 Agent 无法响应用户，token 计数也一直累积。
 
@@ -1510,13 +1839,13 @@ hooks:
 - 用户可随时查看进度（`Read(outputFile)`）
 - 通知以"用户消息"形式进入对话，自然触发新一轮思考
 
-### 17.3 为什么 Fork Agent 要用统一占位符
+### 19.3 为什么 Fork Agent 要用统一占位符
 
 **直接原因**：`prompt cache` 要求 API 请求的前缀字节完全一致。
 
 **效果**：假设同时 Fork 10 个子 Agent，每个 Agent 的系统提示约 10K tokens，如果没有缓存，一次并发就要处理 100K tokens；有了缓存，9 个 Agent 命中缓存，只处理 10K + 9×指令文本 ≈ 11K tokens，**成本降低约 90%**。
 
-### 17.4 权限设计：为什么后台 Agent 不弹框
+### 19.4 权限设计：为什么后台 Agent 不弹框
 
 后台 Agent 在没有 UI 上下文的情况下运行（甚至可能在用户离开屏幕时运行）。自动弹框会：
 1. 无人应答，Agent 永久挂起
@@ -1524,7 +1853,7 @@ hooks:
 
 因此 `shouldAvoidPermissionPrompts: true` 是后台 Agent 的强制约束，它会自动拒绝需要用户确认的操作，保证后台行为的可预期性。
 
-### 17.5 设计哲学：隔离但协调
+### 19.5 设计哲学：隔离但协调
 
 **隔离**：每个子 Agent 有独立的沙箱——文件缓存、中止信号、权限决策、转录日志。子 Agent 不能随意改变主 UI 状态。
 
@@ -1538,14 +1867,14 @@ hooks:
 
 ---
 
-### 17.6 安全设计：O_NOFOLLOW 和磁盘上限
+### 19.6 安全设计：O_NOFOLLOW 和磁盘上限
 
 后台 Agent 的输出路径涉及符号链接，存在被恶意进程替换的风险。系统通过以下手段防御：
 - **O_NOFOLLOW**：创建输出符号链接时使用此标志，防止路径被替换后意外写入错误位置
 - **8MB 单文件读取上限**：防止恶意 Agent 生成超大输出耗尽内存
 - **5GB 总磁盘上限**：系统级配额，超出后自动清理最旧任务
 
-### 17.7 Team Agent 的 1 秒轮询权衡
+### 19.7 Team Agent 的 1 秒轮询权衡
 
 Mailbox 读取采用 1 秒轮询而非基于文件事件（inotify/FSEvents），原因是：
 - 跨平台一致性（inotify 在 Linux/macOS 行为有差异）
