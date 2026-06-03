@@ -26,6 +26,8 @@
 17. [内置 Agent 详解](#17-内置-agent-详解)
 18. [完整示例](#18-完整示例)
 19. [关键设计决策总结](#19-关键设计决策总结)
+20. [task-notification 注入机制：不在系统提示词中](#20-task-notification-注入机制不在系统提示词中)
+21. [执行中的新用户查询处理](#21-执行中的新用户查询处理)
 
 ---
 
@@ -1882,6 +1884,272 @@ Mailbox 读取采用 1 秒轮询而非基于文件事件（inotify/FSEvents）�
 - 实现简单，无需依赖 OS 事件机制
 
 代价是 Teammate Agent 最多有 **1 秒** 的消息接收延迟。
+
+---
+
+## 20. task-notification 注入机制：不在系统提示词中
+
+### 20.1 常见误解
+
+许多人认为异步任务完成通知（`task-notification`）会被追加到"系统提示词（system prompt）"中。**这是错误的。**
+
+它被注入为一条 **`user` 角色消息**，和 `tool_result` 内容放在同一个 API 请求的 `user` 内容块中。
+
+### 20.2 注入位置：`user` 消息，而非系统提示
+
+```
+API 请求结构（task-notification 触发时）：
+
+system: "你是一个 AI 助手..."          ← 系统提示（task-notification 不在这里）
+messages: [
+  ...,
+  assistant: { content: [ tool_use(AgentTool) ] },
+  user: {
+    content: [
+      { type: "tool_result", tool_use_id: "...",
+        content: '{"status":"async_launched",...}' },  ← 原有工具回执
+      { type: "text",
+        text: "<system-reminder>
+                 A background agent completed a task:
+                 <task-notification>
+                   <task-id>agent-abc123</task-id>
+                   <status>completed</status>
+                   <result>分析结果...</result>
+                 </task-notification>
+               </system-reminder>" }               ← task-notification（user 消息中）
+    ]
+  }
+]
+```
+
+### 20.3 完整注入链路
+
+```
+后台 Agent 完成
+  ↓
+agentToolUtils.ts → sendAgentOutput()
+  → commandQueue.push({ mode: 'task-notification', priority: 'later', ... })
+  → enqueuePendingNotification()         // priority = 'later'（最低优先级）
+
+query.ts 主循环（每轮工具执行后）
+  ↓
+sleepRan = toolUseBlocks.some(b => b.name === SLEEP_TOOL_NAME)
+queuedCommandsSnapshot = getCommandsByMaxPriority(
+  sleepRan ? 'later' : 'next'           // SleepTool 运行时才能取出 'later' 优先级命令
+).filter(cmd => cmd.mode === 'task-notification' && cmd.agentId === currentAgentId)
+
+  ↓ 命令 → attachment(queued_command) → toolResult
+
+// messages.ts:3774
+case 'queued_command': {
+  const origin = { kind: 'task-notification' }
+  return wrapMessagesInSystemReminder([          // ← 包裹在 <system-reminder> 标签中
+    createUserMessage({
+      content: wrapCommandText(attachment.prompt, origin),
+      isMeta: true,                              // ← UI 不显示给用户
+      origin,
+    })
+  ])
+}
+
+  ↓
+removeFromQueue(consumedCommands)                // ← 消费后立即从队列删除
+```
+
+### 20.4 关键包装函数
+
+**`wrapCommandText()`**（`messages.ts:5539`）根据消息来源添加不同前缀：
+
+```typescript
+switch (originObj?.kind) {
+  case 'task-notification':
+    return `A background agent completed a task:\n${raw}`
+  case 'coordinator':
+    return `The coordinator sent a message while you were working:\n${raw}\n\n...`
+  case 'human':
+  default:
+    return `The user sent a new message while you were working:\n${raw}\n\nIMPORTANT: ...`
+}
+```
+
+**`wrapMessagesInSystemReminder()`**（`messages.ts:3136`）：
+
+```typescript
+function wrapInSystemReminder(content: string): string {
+  return `<system-reminder>\n${content}\n</system-reminder>`
+}
+```
+
+注意：`<system-reminder>` 是 **XML 标签，写在 user 消息的 text 内容里**，而不是真正的 HTTP 请求 system 字段。大模型读到这些标签时，知道这是系统级注入信息。
+
+### 20.5 一次性 vs 持久：明确是一次性
+
+| 特性 | 系统提示词 | task-notification |
+|------|-----------|-------------------|
+| 位置 | API 请求 `system` 字段 | API 请求 `messages[]` 中的 `user` 内容块 |
+| 持续性 | 每次请求都带 | **一次性**：消费后 `removeFromQueue()` 删除 |
+| 可见性 | 模型每轮都能看到 | 仅注入当轮可见，下轮不重复 |
+| 触发条件 | 始终存在 | 需要 SleepTool 运行 OR 当前轮无工具在执行 |
+| UI 显示 | 不显示 | `isMeta: true`，UI 隐藏 |
+
+### 20.6 SleepTool 的特殊角色
+
+`task-notification` 的优先级是 `'later'`（最低）。只有在 `SleepTool` 运行的那一轮，`getCommandsByMaxPriority('later')` 才会返回这些通知。设计意图：
+
+> **主 Agent 主动"等待"时**（调用 Sleep），才会接收后台任务通知；
+> **主 Agent 正在执行其他工具时**，通知留在队列，等待下一个 Sleep 或对话空闲。
+
+这避免了通知在主 Agent 繁忙时强行打断工具链的问题。
+
+---
+
+## 21. 执行中的新用户查询处理
+
+### 21.1 场景描述
+
+当 Claude 正在执行一个耗时任务（如运行 Bash 命令、调用多个工具），用户在输入框中提交了新的问题——这个新 query 会被怎么处理？
+
+**答案**：它会被**放入优先队列**，当前 query 完成后自动执行，不会打断正在进行的工具调用。
+
+### 21.2 检测与入队（`handlePromptSubmit.ts:313`）
+
+```typescript
+// src/utils/handlePromptSubmit.ts:313
+if (queryGuard.isActive || isExternalLoading) {
+  // 只有 prompt 和 bash 模式才支持排队（斜线命令等不支持）
+  if (mode !== 'prompt' && mode !== 'bash') return
+
+  // 如果有可中断工具在运行（如 SleepTool），先发送中断信号
+  if (params.hasInterruptibleToolInProgress) {
+    params.abortController?.abort('interrupt')
+  }
+
+  // 将用户输入放入全局命令队列
+  enqueue({
+    value: finalInput.trim(),
+    mode,             // 'prompt'
+    priority: 'next', // 高于 task-notification 的 'later'
+    pastedContents: hasImages ? pastedContents : undefined,
+    uuid,
+  })
+
+  onInputChange('')   // 立即清空输入框（用户看到消息已提交）
+  return
+}
+```
+
+关键点：
+- `queryGuard.isActive` 为 `true` 时表示有 query 正在执行
+- `priority: 'next'` 确保用户消息优先于 `task-notification`（`'later'`）
+- 输入框立即清空，给用户"消息已接收"的反馈
+
+### 21.3 全局命令队列（`messageQueueManager.ts`）
+
+```typescript
+const commandQueue: QueuedCommand[] = []  // 模块级单例
+
+// 三个优先级：'now' > 'next' > 'later'
+export function enqueue(command): void {
+  commandQueue.push({ ...command, priority: command.priority ?? 'next' })
+  notifySubscribers()   // 触发 React 重新渲染
+}
+
+export function enqueuePendingNotification(command): void {
+  commandQueue.push({ ...command, priority: 'later' })
+  notifySubscribers()
+}
+```
+
+优先级语义：
+| 优先级 | 用途 | 示例 |
+|--------|------|------|
+| `'now'` | 最高优先，立即处理 | 系统内部紧急注入 |
+| `'next'` | 用户提交的输入 | 用户在执行中发送的新消息 |
+| `'later'` | 后台任务通知 | `task-notification` |
+
+### 21.4 队列处理器（`useQueueProcessor.ts`）
+
+```typescript
+// src/hooks/useQueueProcessor.ts
+export function useQueueProcessor({ executeQueuedInput, hasActiveLocalJsxUI, queryGuard }) {
+  // 订阅 queryGuard：query 开始/结束时触发重渲染
+  const isQueryActive = useSyncExternalStore(
+    queryGuard.subscribe,
+    queryGuard.getSnapshot,
+  )
+
+  // 订阅命令队列：队列变化时触发重渲染
+  const queueSnapshot = useSyncExternalStore(
+    subscribeToCommandQueue,
+    getCommandQueueSnapshot,
+  )
+
+  useEffect(() => {
+    if (isQueryActive) return        // query 仍在运行，等待
+    if (hasActiveLocalJsxUI) return  // 有 UI 交互进行中，等待
+    if (queueSnapshot.length === 0) return
+
+    // 条件满足：取出队列中最高优先级的命令并执行
+    processQueueIfReady({ executeInput: executeQueuedInput })
+  }, [queueSnapshot, isQueryActive, executeQueuedInput, hasActiveLocalJsxUI, queryGuard])
+}
+```
+
+这个 hook 在 REPL 主组件中挂载，**全程监听**：当前 query 一旦结束（`isQueryActive` 变为 `false`），React effect 立即触发，用户排队的消息被取出执行。
+
+### 21.5 消息注入格式
+
+用户在执行中提交的新消息，会被 `wrapCommandText()` 包裹（`messages.ts:5539`）：
+
+```typescript
+case 'human':
+default:
+  return `The user sent a new message while you were working:\n${raw}\n\nIMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.`
+```
+
+即：新消息以 `<system-reminder>` 包裹，前缀是"用户在工作中发来了新消息"，并附有要求模型必须回应的强指令。
+
+### 21.6 完整时序图
+
+```
+用户提交新消息（query 正在执行时）
+  ↓
+handlePromptSubmit.ts:313
+  → queryGuard.isActive = true
+  → enqueue({ value, priority: 'next' })   入队
+  → onInputChange('')                       清空输入框
+  
+（当前 query 继续执行中...）
+  
+query 完成
+  ↓
+queryGuard.end()                            isActive → false
+  ↓
+useSyncExternalStore 触发 useQueueProcessor 重渲染
+  ↓
+useEffect 检查：isQueryActive=false, queueSnapshot.length > 0
+  ↓
+processQueueIfReady({ executeInput: executeQueuedInput })
+  ↓
+取出 priority='next' 的用户消息
+  ↓
+executeQueuedInput([{ value, mode: 'prompt' }])
+  ↓
+新 query 启动，处理用户消息
+```
+
+### 21.7 与 SleepTool 中断的交互
+
+如果当前执行中有 `SleepTool` 在等待（即主 Agent 在"休眠"等待后台任务），用户提交新消息时会触发中断：
+
+```typescript
+if (params.hasInterruptibleToolInProgress) {
+  params.abortController?.abort('interrupt')   // ← 中断 SleepTool
+}
+enqueue({ value, priority: 'next' })           // ← 同时入队
+```
+
+中断信号让 SleepTool 提前结束，`query.ts` 收到中断后退出当前循环，`useQueueProcessor` 随即处理排队的用户消息——用户消息可以**更快被响应**，而不必等待 Sleep 倒计时结束。
 
 ---
 
