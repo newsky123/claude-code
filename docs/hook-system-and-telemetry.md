@@ -149,24 +149,63 @@ executeHooks({ hookInput, toolUseID, matchQuery, ... })
 
 ---
 
-## 五、Hook 在查询生命周期中的挂载点
+## 五、Hook 在查询生命周期中的挂载点（全量）
 
-每个 `execute*Hooks()` 都是对 `executeHooks()` 的一层封装，分别在引擎不同阶段被调用：
+每个 `execute*Hooks()` 都是对 `executeHooks()`（REPL 路径）或 `executeHooksOutsideREPL()`（非 REPL 路径，如 shutdown、通知）的一层封装。
 
-| Hook 事件 | 封装函数（hooks.ts）| 调用点 |
-|-----------|---------------------|--------|
-| UserPromptSubmit | `executeUserPromptSubmitHooks` | `processUserInput.ts:182` 用户输入处理 |
-| SessionStart | `executeSessionStartHooks` | `sessionStart.ts:132` |
-| PreToolUse | `executePreToolHooks` | `toolHooks.ts:466` ← `toolExecution.ts:800` |
-| PostToolUse | `executePostToolHooks` | `toolHooks.ts:56` ← `toolExecution.ts:1483` |
-| PostToolUseFailure | `executePostToolUseFailureHooks` | `toolHooks.ts:212` ← `toolExecution.ts:1700` |
-| Stop | `executeStopHooks` | `query/stopHooks.ts:180` |
-| PreCompact | `executePreCompactHooks` | `services/compact/compact.ts` |
-| SubagentStart | `executeSubagentStartHooks` | `tools/AgentTool/runAgent.ts` |
-| SessionEnd | `executeSessionEndHooks` | `gracefulShutdown.ts` |
-| Elicitation | `executeElicitationHooks` | `services/mcp/elicitationHandler.ts:214` |
+> **为什么第二节列了 27 个事件，但之前只列了 10 行？**
+>
+> 前一版只列了 REPL 内的"主要"调用点。实际上所有 27 个事件**都有**对应的 `execute*Hooks` 封装函数，只是部分事件走 `executeHooksOutsideREPL`（非 async generator，直接 Promise）或专用的 `executeEnvHooks` 包装。以下是完整列表。
 
-### PreToolUse 的特殊地位：权限钩子
+### 5.1 AsyncGenerator 路径（REPL 内，可 yield 消息/阻断）
+
+| Hook 事件 | 封装函数 | matcher 含义 | 调用点 |
+|-----------|---------|-------------|--------|
+| PreToolUse | `executePreToolHooks` | tool_name | `toolHooks.ts:466` ← `toolExecution.ts:800` |
+| PostToolUse | `executePostToolHooks` | tool_name | `toolHooks.ts:56` ← `toolExecution.ts:1483` |
+| PostToolUseFailure | `executePostToolUseFailureHooks` | tool_name | `toolHooks.ts:212` ← `toolExecution.ts:1700` |
+| PermissionDenied | `executePermissionDeniedHooks` | tool_name | `toolExecution.ts`（自动模式分类器拒绝后）|
+| UserPromptSubmit | `executeUserPromptSubmitHooks` | — | `processUserInput.ts:182` |
+| SessionStart | `executeSessionStartHooks` | source | `sessionStart.ts:132` |
+| Setup | `executeSetupHooks` | trigger | `setup.ts`（仓库初始化/维护）|
+| Stop / SubagentStop | `executeStopHooks` | — | `query/stopHooks.ts:180`、`runAgent.ts` |
+| SubagentStart | `executeSubagentStartHooks` | agent_type | `tools/AgentTool/runAgent.ts` |
+| TeammateIdle | `executeTeammateIdleHooks` | — | 队友空闲前触发 |
+| TaskCreated | `executeTaskCreatedHooks` | — | 任务创建工具内 |
+| TaskCompleted | `executeTaskCompletedHooks` | — | 任务完成工具内 |
+| PermissionRequest | `executePermissionRequestHooks` | tool_name | 权限弹窗前 |
+
+### 5.2 Promise 路径（REPL 外 / fire-and-forget）
+
+| Hook 事件 | 封装函数 | matcher 含义 | 调用点 |
+|-----------|---------|-------------|--------|
+| Notification | `executeNotificationHooks` | notification_type | 通知发送时 |
+| StopFailure | `executeStopFailureHooks` | error | API 错误导致 turn 结束 |
+| PreCompact | `executePreCompactHooks` | trigger | `services/compact/compact.ts` |
+| PostCompact | `executePostCompactHooks` | trigger | compact 完成后 |
+| SessionEnd | `executeSessionEndHooks` | reason | `gracefulShutdown.ts` |
+| ConfigChange | `executeConfigChangeHooks` | source | 配置文件 watcher |
+| InstructionsLoaded | `executeInstructionsLoadedHooks` | load_reason | `claudemd.ts`、`attachments.ts` |
+| Elicitation | `executeElicitationHooks` | mcp_server_name | `services/mcp/elicitationHandler.ts:214` |
+| ElicitationResult | `executeElicitationResultHooks` | mcp_server_name | `elicitationHandler.ts:264` |
+
+### 5.3 Env 路径（返回 watchPaths + systemMessages）
+
+| Hook 事件 | 封装函数 | matcher 含义 | 调用点 |
+|-----------|---------|-------------|--------|
+| CwdChanged | `executeCwdChangedHooks` | — | CWD 切换后 |
+| FileChanged | `executeFileChangedHooks` | — | `fileChangedWatcher.ts` 检测到文件变化 |
+
+### 5.4 专用路径（独立返回值格式）
+
+| Hook 事件 | 封装函数 | 调用点 | 返回值特殊性 |
+|-----------|---------|--------|------------|
+| WorktreeCreate | `executeWorktreeCreateHook` | `worktree.ts:715/912` | 返回 `{ worktreePath }` |
+| WorktreeRemove | `executeWorktreeRemoveHook` | `worktree.ts:826/968` | 返回 `boolean`（hook 是否执行了）|
+
+---
+
+## 5.5 PreToolUse 的特殊地位：权限钩子
 
 `runPreToolUseHooks`（`toolHooks.ts:435`）不仅能注入上下文，还能**决定权限**。其 yield 出的 `hookPermissionResult` 经 `resolveHookPermissionDecision()`（`toolHooks.ts:332`）解析。关键不变量：
 
@@ -288,7 +327,402 @@ Hook 可执行任意命令，是 RCE 的高危面，因此有多层防护：
 
 ---
 
-## 九、要点总结
+## 九、如何添加新的 Hook 事件
+
+添加一个全新的 Hook 事件需要改 4 层。以假设新增 `PreFileWrite` 事件为例：
+
+### 步骤 1：注册事件名
+
+在 `src/entrypoints/sdk/coreTypes.ts`（和 `coreSchemas.ts`）的 `HOOK_EVENTS` 数组中添加：
+
+```ts
+export const HOOK_EVENTS = [
+  // ...existing
+  'PreFileWrite',     // ← 新增
+] as const
+```
+
+### 步骤 2：定义 HookInput schema
+
+在 `src/entrypoints/sdk/coreSchemas.ts` 中添加对应的输入 schema：
+
+```ts
+export const PreFileWriteHookInputSchema = lazySchema(() =>
+  BaseHookInputSchema().extend({
+    hook_event_name: z.literal('PreFileWrite'),
+    file_path: z.string(),
+    content: z.string(),
+  })
+)
+```
+
+### 步骤 3：添加事件元数据
+
+在 `src/utils/hooks/hooksConfigManager.ts` 的 `getHookEventMetadata()` 中添加：
+
+```ts
+PreFileWrite: {
+  description: 'Runs before a file write operation',
+  matcherDescription: 'File path pattern',
+  matcherKey: 'file_path',
+  supportsMatcher: true,
+}
+```
+
+### 步骤 4：编写 execute 封装函数
+
+在 `src/utils/hooks.ts` 中添加：
+
+```ts
+export async function* executePreFileWriteHooks(
+  filePath: string,
+  content: string,
+  toolUseContext: ToolUseContext,
+  signal?: AbortSignal,
+): AsyncGenerator<AggregatedHookResult> {
+  const hookInput: PreFileWriteHookInput = {
+    ...createBaseHookInput(undefined, undefined, toolUseContext),
+    hook_event_name: 'PreFileWrite',
+    file_path: filePath,
+    content,
+  }
+  yield* executeHooks({
+    hookInput,
+    toolUseID: randomUUID(),
+    matchQuery: filePath,
+    signal,
+    toolUseContext,
+  })
+}
+```
+
+### 步骤 5：在业务代码中调用
+
+在工具执行路径（如 `toolExecution.ts`）的适当位置调用。
+
+### 注册内部 Callback Hook（遥测用）
+
+不需要新事件，只需要在已有事件上挂新回调：
+
+```ts
+registerHookCallbacks({
+  PostToolUse: [
+    { matcher: 'MyNewTool', hooks: [{
+      type: 'callback',
+      callback: myTelemetryHandler,
+      timeout: 1,
+      internal: true,  // 走快速路径，不污染用户 hook 指标
+    }] },
+  ],
+})
+```
+
+调用时机：`setup.ts` 初始化阶段（`registerSessionFileAccessHooks()` 就在这里被调用）。
+
+### 注册 Session 级动态 Hook
+
+通过 `sessionHooks.ts` 的 `addSessionHook()` 或 `addFunctionHook()`，运行时动态添加 hook，session 结束自动清除：
+
+```ts
+addFunctionHook(setAppState, sessionId, 'Stop', '*', myCallback, 'error msg')
+```
+
+---
+
+## 十、每个 Hook 的函数原型
+
+所有封装函数定义在 `src/utils/hooks.ts`，以下按返回值类型分组列出完整签名。
+
+### 10.1 AsyncGenerator 路径（可 yield 消息、阻断、权限决策）
+
+```ts
+// ─── 工具相关 ───
+
+async function* executePreToolHooks<ToolInput>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,    // default: TOOL_HOOK_EXECUTION_TIMEOUT_MS
+  requestPrompt?: (sourceName: string, toolInputSummary?: string | null)
+    => (request: PromptRequest) => Promise<PromptResponse>,
+  toolInputSummary?: string | null,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executePostToolHooks<ToolInput, ToolResponse>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  toolResponse: ToolResponse,
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executePostToolUseFailureHooks<ToolInput>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  error: string,
+  toolUseContext: ToolUseContext,
+  isInterrupt?: boolean,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executePermissionDeniedHooks<ToolInput>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  reason: string,
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executePermissionRequestHooks<ToolInput>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  permissionSuggestions?: PermissionUpdate[],
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  requestPrompt?: (...) => ...,
+  toolInputSummary?: string | null,
+): AsyncGenerator<AggregatedHookResult>
+
+// ─── 用户输入与会话 ───
+
+async function* executeUserPromptSubmitHooks(
+  prompt: string,
+  permissionMode: string,
+  toolUseContext: ToolUseContext,
+  requestPrompt?: (...) => ...,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executeSessionStartHooks(
+  source: 'startup' | 'resume' | 'clear' | 'compact',
+  sessionId?: string,
+  agentType?: string,
+  model?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  forceSyncExecution?: boolean,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executeSetupHooks(
+  trigger: 'init' | 'maintenance',
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  forceSyncExecution?: boolean,
+): AsyncGenerator<AggregatedHookResult>
+
+// ─── 停止与 Agent ───
+
+async function* executeStopHooks(
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  stopHookActive?: boolean,  // default: false
+  subagentId?: AgentId,      // 有值时 hookEvent='SubagentStop'，否则='Stop'
+  toolUseContext?: ToolUseContext,
+  messages?: Message[],
+  agentType?: string,
+  requestPrompt?: (...) => ...,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executeSubagentStartHooks(
+  agentId: string,
+  agentType: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): AsyncGenerator<AggregatedHookResult>
+
+// ─── 团队与任务 ───
+
+async function* executeTeammateIdleHooks(
+  teammateName: string,
+  teamName: string,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executeTaskCreatedHooks(
+  taskId: string,
+  taskSubject: string,
+  taskDescription?: string,
+  teammateName?: string,
+  teamName?: string,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  toolUseContext?: ToolUseContext,
+): AsyncGenerator<AggregatedHookResult>
+
+async function* executeTaskCompletedHooks(
+  taskId: string,
+  taskSubject: string,
+  taskDescription?: string,
+  teammateName?: string,
+  teamName?: string,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+  toolUseContext?: ToolUseContext,
+): AsyncGenerator<AggregatedHookResult>
+```
+
+### 10.2 Promise 路径（fire-and-forget 或同步等待结果）
+
+```ts
+async function executeNotificationHooks(
+  notificationData: {
+    message: string
+    title?: string
+    notificationType: string
+  },
+  timeoutMs?: number,
+): Promise<void>
+
+async function executeStopFailureHooks(
+  lastMessage: AssistantMessage,
+  toolUseContext?: ToolUseContext,
+  timeoutMs?: number,
+): Promise<void>
+
+async function executePreCompactHooks(
+  compactData: {
+    trigger: 'manual' | 'auto'
+    customInstructions: string | null
+  },
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<{
+  newCustomInstructions?: string
+  userDisplayMessage?: string
+}>
+
+async function executePostCompactHooks(
+  compactData: {
+    trigger: 'manual' | 'auto'
+    compactSummary: string
+  },
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<{ userDisplayMessage?: string }>
+
+async function executeSessionEndHooks(
+  reason: ExitReason,
+  options?: {
+    getAppState?: () => AppState
+    setAppState?: (updater: (prev: AppState) => AppState) => void
+    signal?: AbortSignal
+    timeoutMs?: number
+  },
+): Promise<void>
+
+async function executeConfigChangeHooks(
+  source: ConfigChangeSource,  // 'user_settings'|'project_settings'|'local_settings'|'policy_settings'|'skills'
+  filePath?: string,
+  timeoutMs?: number,
+): Promise<HookOutsideReplResult[]>
+
+async function executeInstructionsLoadedHooks(
+  filePath: string,
+  memoryType: InstructionsMemoryType,  // 'User'|'Project'|'Local'|'Managed'
+  loadReason: InstructionsLoadReason,   // 'session_start'|'nested_traversal'|'path_glob_match'|'include'|'compact'
+  options?: {
+    globs?: string[]
+    triggerFilePath?: string
+    parentFilePath?: string
+    timeoutMs?: number
+  },
+): Promise<void>
+
+async function executeElicitationHooks(params: {
+  serverName: string
+  message: string
+  requestedSchema?: Record<string, unknown>
+  permissionMode?: string
+  signal?: AbortSignal
+  timeoutMs?: number
+  mode?: 'form' | 'url'
+  url?: string
+  elicitationId?: string
+}): Promise<ElicitationHookResult>
+
+async function executeElicitationResultHooks(params: {
+  serverName: string
+  action: 'accept' | 'decline' | 'cancel'
+  content?: Record<string, unknown>
+  permissionMode?: string
+  signal?: AbortSignal
+  timeoutMs?: number
+  mode?: 'form' | 'url'
+  elicitationId?: string
+}): Promise<ElicitationResultHookResult>
+```
+
+### 10.3 Env 路径（CWD/文件变化）
+
+```ts
+function executeCwdChangedHooks(
+  oldCwd: string,
+  newCwd: string,
+  timeoutMs?: number,
+): Promise<{
+  results: HookOutsideReplResult[]
+  watchPaths: string[]
+  systemMessages: string[]
+}>
+
+function executeFileChangedHooks(
+  filePath: string,
+  event: 'change' | 'add' | 'unlink',
+  timeoutMs?: number,
+): Promise<{
+  results: HookOutsideReplResult[]
+  watchPaths: string[]
+  systemMessages: string[]
+}>
+```
+
+### 10.4 Worktree 专用路径
+
+```ts
+async function executeWorktreeCreateHook(
+  slug: string,
+): Promise<{ worktreePath: string }>
+// 返回 hook 创建的 worktree 路径
+
+async function executeWorktreeRemoveHook(
+  worktreePath: string,
+): Promise<boolean>
+// 返回 hook 是否存在并被执行
+```
+
+### 10.5 PostSampling（采样后处理）
+
+```ts
+// src/utils/hooks/postSamplingHooks.ts:45
+async function executePostSamplingHooks(
+  toolUseContext: ToolUseContext,
+  messages: Message[],
+  signal?: AbortSignal,
+): Promise<void>
+```
+
+---
+
+## 十一、要点总结
 
 1. **统一引擎**：所有 hook（用户的 + 内部遥测的）共用 `executeHooks()` 的事件匹配与分发。
 2. **遥测即 Hook**：文件访问、commit 归因等遥测被实现为 `internal: true` 的 PostToolUse callback hook，复用生命周期分发，不污染用户 hook 指标，且走快速路径。
